@@ -73,6 +73,7 @@ def create_event(location, t, d, calid):
                                                 "end": {"dateTime": end.isoformat(), "timeZone": 'PST'},
                                             }
         ).execute()
+        print("Uploaded")
 
         return event_result['id']
 
@@ -90,10 +91,15 @@ args = parser.parse_args()
 start_date = date.fromisoformat(args.startdate)
 
 cals = get_all_cal()
+print(cals)
 
 for summary, calid, primary in cals:
     if summary == args.calendar_name:
         CALENDAR_ID = calid
+
+if not CALENDAR_ID:
+    print(f"Could not find Calendar: {args.calendar_name}")
+    exit(1)
 
 reader = PdfReader(args.filepath)
 page = reader.pages[0]
@@ -117,6 +123,7 @@ def abrv2timeandloc(abrv):
         location = "Function Junction Depot"
     if "SL" in abrv:
         location = "Squamish Landfill"
+        t = (time(hour = 8), time(hour = 16))
     if "WTS" in abrv:
         location = "Whistler Transfert Station"
         t = (time(hour = 8), time(hour = 17))
