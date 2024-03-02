@@ -124,7 +124,7 @@ def abrv2timeandloc(abrv):
     if "SL" in abrv:
         location = "Squamish Landfill"
         t = (time(hour = 8), time(hour = 16))
-    if "WTS" in abrv:
+    if abrv in ["WTS", "WT"] :
         location = "Whistler Transfert Station"
         t = (time(hour = 8), time(hour = 17))
     if "7" in abrv:
