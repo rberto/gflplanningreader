@@ -1,20 +1,25 @@
 from datetime import date, timedelta, time, datetime
-from pypdf import PdfReader
+import pymupdf
 import os.path
 import pickle
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
-import argparse
 from backports.zoneinfo import ZoneInfo
+from pathlib import Path
+from dateutil.parser import parse
+import re
+import base64
+from glob import MAIL_FILTER, PDFS_PATH, CALENDAR_NAME, NAME
 
-SCOPES = ['https://www.googleapis.com/auth/calendar']
+
+SCOPES = ['https://www.googleapis.com/auth/calendar', "https://www.googleapis.com/auth/gmail.readonly"]
 
 CREDENTIALS_FILE = 'credentials.json'
 
 CALENDAR_ID = None
 
-def get_calendar_service():
+def get_services():
    creds = None
    # The file token.pickle stores the user's access and refresh tokens, and is
    # created automatically when the authorization flow completes for the first
@@ -35,11 +40,12 @@ def get_calendar_service():
        with open('token.pickle', 'wb') as token:
            pickle.dump(creds, token)
 
-   service = build('calendar', 'v3', credentials=creds)
-   return service
+   calendar_service = build('calendar', 'v3', credentials=creds)
+   mail_service = build("gmail", "v1", credentials=creds)
 
-def get_all_cal():
-    service = get_calendar_service()
+   return calendar_service, mail_service
+
+def get_all_cal(service):
     cals = []
     # Call the Calendar API
     print('Getting list of calendars')
@@ -56,15 +62,14 @@ def get_all_cal():
         cals.append((summary, id, primary))
     return cals
 
-def create_event(location, t, d, calid):
-    service = get_calendar_service()
+def create_event(service, location, t, d, calid):
 
     start = datetime(year = d.year, month = d.month, day = d.day, hour = t[0].hour, minute = t[0].minute, tzinfo = ZoneInfo("America/Vancouver"))
     end = datetime(year = d.year, month = d.month, day = d.day, hour = t[1].hour, minute = t[1].minute, tzinfo = ZoneInfo("America/Vancouver"))
 
     print(location, d, start, end)
 
-    if args.upload and CALENDAR_ID:
+    if CALENDAR_ID:
         event_result = service.events().insert(calendarId=calid,
                                             body={
                                                 "summary": location,
@@ -77,43 +82,56 @@ def create_event(location, t, d, calid):
 
         return event_result['id']
 
-parser = argparse.ArgumentParser(
-                    prog='gflplanningreader',
-                    description='Reads planning from GFL and uploads it to my google calendar')
+def get_reception_year(mail):
+    for h in mail["payload"]["headers"]:
+        if "Date" in h["name"]:
+            return parse(h["value"]).year
 
-parser.add_argument('filepath', help = "Path to PDF planning file to read")
-parser.add_argument('startdate', help = "Date of the first day on the schedule")
-parser.add_argument('calendar_name', help = "Name of the google calendar to upload the events to.")
-parser.add_argument('-u', '--upload', action="store_true", help = "Only upload the events to google calendar if option present.")
+def download_new_schedules(service):
+    downloaded_files = []
+    results = mail_service.users().messages().list(userId="me", q=MAIL_FILTER).execute()
+    
+    for msg in results["messages"]:
+        mail = mail_service.users().messages().get(userId="me", id = msg["id"], format="full").execute()
+        year = get_reception_year(mail)
+        for part in mail["payload"]["parts"]:
+            if not "filename" in part:
+                continue
 
-args = parser.parse_args()
+            attachement_filename = part["filename"]
+            
+            if not attachement_filename or Path(PDFS_PATH, attachement_filename).exists():
+                continue
 
-start_date = date.fromisoformat(args.startdate)
+            if not "DEPOT" in attachement_filename:
+                # Skip attachement witout DEPOT in the filename
+                continue
+            
+            attachment_id = part["body"]["attachmentId"]
 
-cals = get_all_cal()
-print(cals)
+            at = mail_service.users().messages().attachments().get(userId="me", messageId = msg["id"], id=attachment_id).execute()
 
-for summary, calid, primary in cals:
-    if summary == args.calendar_name:
-        CALENDAR_ID = calid
+            bat = base64.urlsafe_b64decode(at['data'].encode('UTF-8'))
+            with open(f"{Path(PDFS_PATH, attachement_filename)}", "bw") as f:
+                f.write(bat)
 
-if not CALENDAR_ID:
-    print(f"Could not find Calendar: {args.calendar_name}")
-    exit(1)
+            print((attachement_filename, year))
+            downloaded_files.append((attachement_filename, year))
 
-reader = PdfReader(args.filepath)
-page = reader.pages[0]
-for line in page.extract_text().split('\n'):
-    if "Romain" in line or "Rom ain" in line:
-        shifts = line.replace(" ", ".").split(".")[2:-1]
-        while len(shifts) > 14:
-            print("To much days, select unnecessary columnn to be deleted:\n", [x for x in zip(range(0, len(shifts)), shifts)])
-            text = input("Column index: ")
-            if text.isdigit() and int(text) > 0 and int(text) < len(shifts):
-                del shifts[int(text)]
-            else:
-                exit(1)
-        print(shifts)
+    return downloaded_files
+
+def get_shifts(pdffile):
+    doc = pymupdf.open(Path(PDFS_PATH, pdffile)) # open a document
+    for page in doc: # iterate the document pages
+        text = page.get_text().encode("utf8") # get plain text (is in UTF-8)
+
+    page = doc[0] # get the 1st page of the document
+    tabs = page.find_tables() # locate and extract any tables on page
+
+    for line in tabs[0].extract():
+        line[0] = line[0].replace(" ", "") # Clean the name extract from pdf
+        if NAME in line:
+            return line[1:]
 
 def abrv2timeandloc(abrv):
     location = ""
@@ -138,9 +156,40 @@ def abrv2timeandloc(abrv):
 
     return (location, t)
 
-d = start_date
-for shift in shifts:
-    if shift:
-        location, t = abrv2timeandloc(shift)
-        create_event(location, t, d, CALENDAR_ID)
-    d = d + timedelta(days = 1)
+def get_start_date_from_filename(filename, year):
+    m = re.search("\w* [0-9]+", filename, flags=0)
+    if m:
+        da = parse(m.group(0), ignoretz = True)
+        da = datetime(year = year, month = da.month, day = da.day)
+        return da
+    else:
+        return None
+
+
+if __name__ == "__main__":
+
+    cals_service, mail_service = get_services()
+
+    cals = get_all_cal(cals_service)
+
+    for summary, calid, primary in cals:
+        if summary == CALENDAR_NAME:
+            CALENDAR_ID = calid
+
+    if not CALENDAR_ID:
+        print(f"Could not find Calendar: {CALENDAR_NAME}")
+        exit(1)
+
+    filenames = download_new_schedules(mail_service)
+
+    for filename, year in filenames:
+        shifts = get_shifts(filename)
+        d = get_start_date_from_filename(filename, year)
+
+        for shift in shifts:
+            if shift:
+                location, t = abrv2timeandloc(shift)
+                print(location, t, d)
+
+                create_event(cals_service, location, t, d, CALENDAR_ID)
+            d = d + timedelta(days = 1)
